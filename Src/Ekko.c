@@ -1,112 +1,99 @@
 #include <Common.h>
 #include <Ekko.h>
 
-VOID EkkoObf( DWORD SleepTime )
-{
-    CONTEXT CtxThread   = { 0 };
+#define KEY_BUF_SIZE 16
 
-    CONTEXT RopProtRW   = { 0 };
-    CONTEXT RopMemEnc   = { 0 };
-    CONTEXT RopDelay    = { 0 };
-    CONTEXT RopMemDec   = { 0 };
-    CONTEXT RopProtRX   = { 0 };
-    CONTEXT RopSetEvt   = { 0 };
+void EkkoObf( DWORD sleepTime )
+{
+    CONTEXT ctxThread = { 0 };
+
+    CONTEXT contexts[6] = { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } }; 
 
     HANDLE  hTimerQueue = NULL;
     HANDLE  hNewTimer   = NULL;
-    HANDLE  hEvent      = NULL;
-    PVOID   ImageBase   = NULL;
-    DWORD   ImageSize   = 0;
-    DWORD   OldProtect  = 0;
+    HANDLE  hEvent      = CreateEventW( 0, 0, 0, 0 );
+    PVOID   imageBase   = GetModuleHandleA( NULL );
+    DWORD   imageSize   = ( ( PIMAGE_NT_HEADERS ) ( imageBase + ( ( PIMAGE_DOS_HEADER ) imageBase )->e_lfanew ) )->OptionalHeader.SizeOfImage;
+    DWORD   oldProtect  = 0;
 
-    // Can be randomly generated
-    CHAR    KeyBuf[ 16 ]= { 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55 };
-    USTRING Key         = { 0 };
-    USTRING Img         = { 0 };
+    CHAR    keyBuf[KEY_BUF_SIZE] = { 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55 };
+    USTRING key = { .Buffer = keyBuf, .Length = KEY_BUF_SIZE, .MaximumLength = KEY_BUF_SIZE };
+    USTRING img = { .Buffer = imageBase, .Length = imageSize, .MaximumLength = imageSize };
 
-    PVOID   NtContinue  = NULL;
-    PVOID   SysFunc032  = NULL;
+    PVOID   NtContinue  = GetProcAddress( GetModuleHandleA( "Ntdll" ), "NtContinue" );
+    PVOID   SysFunc032  = GetProcAddress( LoadLibraryA( "Advapi32" ),  "SystemFunction032" );
 
-    hEvent      = CreateEventW( 0, 0, 0, 0 );
     hTimerQueue = CreateTimerQueue();
 
-    NtContinue  = GetProcAddress( GetModuleHandleA( "Ntdll" ), "NtContinue" );
-    SysFunc032  = GetProcAddress( LoadLibraryA( "Advapi32" ),  "SystemFunction032" );
-
-    ImageBase   = GetModuleHandleA( NULL );
-    ImageSize   = ( ( PIMAGE_NT_HEADERS ) ( ImageBase + ( ( PIMAGE_DOS_HEADER ) ImageBase )->e_lfanew ) )->OptionalHeader.SizeOfImage;
-
-    Key.Buffer  = KeyBuf;
-    Key.Length  = Key.MaximumLength = 16;
-
-    Img.Buffer  = ImageBase;
-    Img.Length  = Img.MaximumLength = ImageSize;
-
-    if ( CreateTimerQueueTimer( &hNewTimer, hTimerQueue, RtlCaptureContext, &CtxThread, 0, 0, WT_EXECUTEINTIMERTHREAD ) )
+    if ( CreateTimerQueueTimer( &hNewTimer, hTimerQueue, RtlCaptureContext, &ctxThread, 0, 0, WT_EXECUTEINTIMERTHREAD ) )
     {
         WaitForSingleObject( hEvent, 0x32 );
 
-        memcpy( &RopProtRW, &CtxThread, sizeof( CONTEXT ) );
-        memcpy( &RopMemEnc, &CtxThread, sizeof( CONTEXT ) );
-        memcpy( &RopDelay,  &CtxThread, sizeof( CONTEXT ) );
-        memcpy( &RopMemDec, &CtxThread, sizeof( CONTEXT ) );
-        memcpy( &RopProtRX, &CtxThread, sizeof( CONTEXT ) );
-        memcpy( &RopSetEvt, &CtxThread, sizeof( CONTEXT ) );
+        for(int i = 0; i < 6; i++) {
+            memcpy( &contexts[i], &ctxThread, sizeof( CONTEXT ) );
+        }
 
-        // VirtualProtect( ImageBase, ImageSize, PAGE_READWRITE, &OldProtect );
-        RopProtRW.Rsp  -= 8;
-        RopProtRW.Rip   = VirtualProtect;
-        RopProtRW.Rcx   = ImageBase;
-        RopProtRW.Rdx   = ImageSize;
-        RopProtRW.R8    = PAGE_READWRITE;
-        RopProtRW.R9    = &OldProtect;
+        // Prepare CONTEXTs for ROP chain
+        PrepareContexts(contexts, imageBase, imageSize, oldProtect, SysFunc032, &img, &key, sleepTime, hEvent);
 
-        // SystemFunction032( &Key, &Img );
-        RopMemEnc.Rsp  -= 8;
-        RopMemEnc.Rip   = SysFunc032;
-        RopMemEnc.Rcx   = &Img;
-        RopMemEnc.Rdx   = &Key;
+        printf( "[INFO] Queue timers\n" );
 
-        // WaitForSingleObject( hTargetHdl, SleepTime );
-        RopDelay.Rsp   -= 8;
-        RopDelay.Rip    = WaitForSingleObject;
-        RopDelay.Rcx    = NtCurrentProcess();
-        RopDelay.Rdx    = SleepTime;
+        for(int i = 0; i < 6; i++) {
+            CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &contexts[i], (i+1)*100, 0, WT_EXECUTEINTIMERTHREAD );
+        }
 
-        // SystemFunction032( &Key, &Img );
-        RopMemDec.Rsp  -= 8;
-        RopMemDec.Rip   = SysFunc032;
-        RopMemDec.Rcx   = &Img;
-        RopMemDec.Rdx   = &Key;
-
-        // VirtualProtect( ImageBase, ImageSize, PAGE_EXECUTE_READWRITE, &OldProtect );
-        RopProtRX.Rsp  -= 8;
-        RopProtRX.Rip   = VirtualProtect;
-        RopProtRX.Rcx   = ImageBase;
-        RopProtRX.Rdx   = ImageSize;
-        RopProtRX.R8    = PAGE_EXECUTE_READWRITE;
-        RopProtRX.R9    = &OldProtect;
-
-        // SetEvent( hEvent );
-        RopSetEvt.Rsp  -= 8;
-        RopSetEvt.Rip   = SetEvent;
-        RopSetEvt.Rcx   = hEvent;
-
-        puts( "[INFO] Queue timers" );
-
-        CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &RopProtRW, 100, 0, WT_EXECUTEINTIMERTHREAD );
-        CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &RopMemEnc, 200, 0, WT_EXECUTEINTIMERTHREAD );
-        CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &RopDelay,  300, 0, WT_EXECUTEINTIMERTHREAD );
-        CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &RopMemDec, 400, 0, WT_EXECUTEINTIMERTHREAD );
-        CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &RopProtRX, 500, 0, WT_EXECUTEINTIMERTHREAD );
-        CreateTimerQueueTimer( &hNewTimer, hTimerQueue, NtContinue, &RopSetEvt, 600, 0, WT_EXECUTEINTIMERTHREAD );
-
-        puts( "[INFO] Wait for hEvent" );
+        printf( "[INFO] Wait for hEvent\n" );
 
         WaitForSingleObject( hEvent, INFINITE );
 
-        puts( "[INFO] Finished waiting for event" );
+        printf( "[INFO] Finished waiting for event\n" );
     }
 
     DeleteTimerQueue( hTimerQueue );
 }
+
+void PrepareContexts(CONTEXT* contexts, PVOID imageBase, DWORD imageSize, DWORD oldProtect, PVOID SysFunc032, USTRING* img, USTRING* key, DWORD sleepTime, HANDLE hEvent) {
+    //  I have to give it to you - this ROP chain was a beast of a challenge.
+    //  Let's be honest, this ROP chain was tough even with VirtualProtect.
+    //  It would be beneficial for me to experiment with other Win API functions if I had more time.
+
+    // VirtualProtect( ImageBase, ImageSize, PAGE_READWRITE, &OldProtect );
+    contexts[0].Rsp -= 8;
+    contexts[0].Rip  = VirtualProtect;
+    contexts[0].Rcx  = imageBase;
+    contexts[0].Rdx  = imageSize;
+    contexts[0].R8   = PAGE_READWRITE;
+    contexts[0].R9   = &oldProtect;
+
+    // SystemFunction032( &Key, &Img );
+    contexts[1].Rsp -= 8;
+    contexts[1].Rip  = SysFunc032;
+    contexts[1].Rcx  = img;
+    contexts[1].Rdx  = key;
+
+    // WaitForSingleObject( hTargetHdl, SleepTime );
+    contexts[2].Rsp  -= 8;
+    contexts[2].Rip   = WaitForSingleObject;
+    contexts[2].Rcx   = NtCurrentProcess();
+    contexts[2].Rdx   = sleepTime;
+
+    // SystemFunction032( &Key, &Img );
+    contexts[3].Rsp  -= 8;
+    contexts[3].Rip   = SysFunc032;
+    contexts[3].Rcx   = img;
+    contexts[3].Rdx   = key;
+
+    // VirtualProtect( ImageBase, ImageSize, PAGE_EXECUTE_READWRITE, &OldProtect );
+    contexts[4].Rsp  -= 8;
+    contexts[4].Rip   = VirtualProtect;
+    contexts[4].Rcx   = imageBase;
+    contexts[4].Rdx   = imageSize;
+    contexts[4].R8    = PAGE_EXECUTE_READWRITE;
+    contexts[4].R9    = &oldProtect;
+
+    // SetEvent( hEvent );
+    contexts[5].Rsp  -= 8;
+    contexts[5].Rip   = SetEvent;
+    contexts[5].Rcx   = hEvent;
+}
+
